@@ -10,6 +10,8 @@ from mask_rcnn_processor import MaskRCNNThyroidAnalyzer
 from yolo_sam_processor import YOLOSAMNodeAnalyzer
 import torch
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+import time
+from threading import Timer
 
 
 bot = telebot.TeleBot(TOKEN)
@@ -113,8 +115,11 @@ def handle_photo(message):
         if 'Carotis' in found_classes:
             caption += "🟢 Сонная артерия\n"
 
+        messages_to_delete = []
+
         with open(processed_path, 'rb') as photo:
-            bot.send_photo(message.chat.id, photo, caption=caption.strip())
+            sent_msg = bot.send_photo(message.chat.id, photo, caption=caption.strip())
+            messages_to_delete.append(sent_msg.message_id)
 
         # Если есть обрезанное изображение, сохраняем его для дальнейшей работы
         if combined_cropped_path:
@@ -131,7 +136,8 @@ def handle_photo(message):
 
             if masks and mask_vis_path:
                 with open(mask_vis_path, 'rb') as mask_file:
-                    bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
+                    sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
+                    messages_to_delete.append(sent_msg.message_id)
                 collage = create_collage(processed_path, mask_vis_path)
                 caption = "✅ AI-анализ выполнен"
             else:
@@ -143,11 +149,15 @@ def handle_photo(message):
                 try:
                     collage.save(collage_path)
                     with open(collage_path, 'rb') as collage_file:
-                        bot.send_photo(
+                        sent_msg = bot.send_photo(
                             message.chat.id,
                             collage_file,
                             caption=caption
                         )
+
+                    # Запускаем таймер для удаления предыдущих сообщений через 5 секунд
+                    Timer(5.0, delete_messages, args=[message.chat.id, messages_to_delete]).start()
+
                 except Exception as e:
                     logging.error(f"Error saving/sending collage: {e}")
                     bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
@@ -172,6 +182,17 @@ def handle_photo(message):
     except Exception as e:
         logging.error(f"Error processing photo: {e}")
         bot.reply_to(message, "⚠ Произошла ошибка при обработке изображения. Пожалуйста, попробуйте позже.")
+
+
+def delete_messages(chat_id, message_ids):
+    try:
+        for msg_id in message_ids:
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except Exception as e:
+                logging.error(f"Error deleting message {msg_id}: {e}")
+    except Exception as e:
+        logging.error(f"Error in delete_messages: {e}")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('rate_'))
