@@ -108,17 +108,23 @@ class MaskRCNNThyroidAnalyzer:
         labels = labels[keep]
         masks = masks[keep]
 
+        if len(boxes) == 0:
+            print("Ничего не найдено")
+            return image
+
+        img_array = np.array(image).astype(np.float32) / 255.0
         color_map = {
             1: [0.4, 0, 0.4],
             2: [0, 1, 0],
         }
 
-        img_array = np.array(image).astype(np.float32) / 255.0
+        displayed_classes = set()
 
-        for box, label, mask in zip(boxes, labels, masks):
-            if label not in color_map:
+        for score, box, label, mask in sorted(zip(scores, boxes, labels, masks), key=lambda x: x[0], reverse=True):
+            if label in displayed_classes or label not in color_map:
                 continue
 
+            displayed_classes.add(label)
             color = color_map[label]
             class_name = self.class_names[label]
 
@@ -152,4 +158,5 @@ class MaskRCNNThyroidAnalyzer:
             )
 
         result_img = Image.fromarray((img_array * 255).astype(np.uint8))
+
         return result_img

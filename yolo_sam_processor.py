@@ -12,25 +12,20 @@ from segment_anything import sam_model_registry, SamPredictor
 
 class YOLOSAMNodeAnalyzer:
     def __init__(self, yolo_weights_path, sam_checkpoint_path, sam_finetuned_path, model_type="vit_h"):
-        # Инициализируем YOLO
         self.yolo = YOLO(yolo_weights_path)
 
-        # Инициализируем SAM
         self.sam = sam_model_registry[model_type](checkpoint=sam_checkpoint_path)
         self.sam.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-        # Загружаем дообученные веса SAM
         checkpoint = torch.load(sam_finetuned_path, map_location='cpu')
         self.sam.mask_decoder.load_state_dict(checkpoint['mask_decoder_state_dict'])
         self.sam.eval()
 
-        # Папки
         self.output_dir = "sam_predictions"
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "masks"), exist_ok=True)
 
     def run_yolo_on_image(self, image_path):
-        """Запуск YOLO и получение bounding box с именами классов"""
         results = self.yolo(image_path)
         boxes = []
 
@@ -40,8 +35,7 @@ class YOLOSAMNodeAnalyzer:
                 cls_id = int(box.cls.item())
                 conf = box.conf.item()
 
-                # Используем имя класса вместо цифры
-                class_name = 'Node'  # если только один класс
+                class_name = 'Node'
 
                 boxes.append({
                     'bbox': xyxy,
@@ -53,7 +47,6 @@ class YOLOSAMNodeAnalyzer:
         return boxes
 
     def run_sam_with_boxes(self, image_path, boxes):
-        """Запуск SAM с боксами из YOLO и визуализация с красной маской и подписью 'Node'"""
         image = cv2.imread(image_path)
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_for_drawing = image_rgb.copy()
@@ -77,20 +70,16 @@ class YOLOSAMNodeAnalyzer:
             binary_mask = masks[0].astype(np.uint8)
             all_masks.append(binary_mask)
 
-            # Рисуем красную полупрозрачную маску
             mask_overlay = np.zeros_like(image_for_drawing)
-            mask_overlay[binary_mask == 1] = [255, 0, 0]  # красная маска
+            mask_overlay[binary_mask == 1] = [255, 0, 0]
             image_for_drawing = cv2.addWeighted(image_for_drawing, 1.0, mask_overlay, 0.5, 0)
 
-            # Рисуем бокс
             x1, y1, x2, y2 = map(int, bbox)
-            cv2.rectangle(image_for_drawing, (x1, y1), (x2, y2), (255, 0, 0), 1)  # красный бокс
+            cv2.rectangle(image_for_drawing, (x1, y1), (x2, y2), (255, 0, 0), 1)
 
-            # Подпись над боксом
             label_text = f"{box['class_name']}"
             text_size, _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
 
-            # Позиция текста
             text_x = x1
             text_y = y1 - 5
 
@@ -136,9 +125,13 @@ class YOLOSAMNodeAnalyzer:
             print("[INFO] Узлы не найдены YOLO.")
             return None, None
 
-        print(f"[DEBUG] Найдено {len(boxes)} узлов.")
+        sorted_boxes = sorted(boxes, key=lambda x: x['conf'], reverse=True)
+
+        best_box = sorted_boxes[0]
+
+        print(f"[DEBUG] Найдено {len(boxes)} узлов. Используется самый уверенный.")
 
         print(f"[DEBUG] Точная сегментация через SAM...")
-        masks, mask_vis_path = self.run_sam_with_boxes(cropped_image_path, boxes)
+        masks, mask_vis_path = self.run_sam_with_boxes(cropped_image_path, [best_box])
 
         return masks, mask_vis_path

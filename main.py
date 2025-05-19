@@ -2,13 +2,15 @@ import logging
 import os
 from datetime import datetime
 import telebot
+from PIL.ImageDraw import ImageDraw
 from telebot import types
 from config import TOKEN
 from database import db
 from mask_rcnn_processor import MaskRCNNThyroidAnalyzer
 from yolo_sam_processor import YOLOSAMNodeAnalyzer
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
 
 bot = telebot.TeleBot(TOKEN)
 MODEL_PATH = 'neural_networks/mask_rcnn_model_screen.pth'
@@ -22,7 +24,6 @@ os.makedirs('user_scans/processed', exist_ok=True)
 def send_welcome(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("Анализ снимка (AI) 🔍", "Оценка по ACR TI-RADS📊")
-    markup.row("ℹ️ Справка")
 
     try:
         db.execute_query(
@@ -107,7 +108,7 @@ def handle_photo(message):
         # Обрезаем изображение по объединённой области Thyroid + Carotis
         combined_cropped_path = processor_mask_rcnn._crop_combined_thyroid_carotis(img, prediction_dict, original_path)
 
-        caption = "AI-анализ завершён 🧠\n\nНа изображении выделены:\n"
+        caption = "Анализирую... 🧠\n\nНа изображении выделены:\n"
         caption += "🟣 Щитовидная железа\n"
         if 'Carotis' in found_classes:
             caption += "🟢 Сонная артерия\n"
@@ -130,7 +131,28 @@ def handle_photo(message):
 
             if masks and mask_vis_path:
                 with open(mask_vis_path, 'rb') as mask_file:
-                    bot.send_photo(message.chat.id, mask_file, caption="🟢 Точный анализ узла завершён")
+                    bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
+                collage = create_collage(processed_path, mask_vis_path)
+                caption = "✅ AI-анализ выполнен"
+            else:
+                collage = create_single_image_collage(processed_path)
+                caption = "✅ AI-анализ выполнен"
+
+            if collage:
+                collage_path = os.path.join('user_scans', 'processed', f"collage_{timestamp}.png")
+                try:
+                    collage.save(collage_path)
+                    with open(collage_path, 'rb') as collage_file:
+                        bot.send_photo(
+                            message.chat.id,
+                            collage_file,
+                            caption=caption
+                        )
+                except Exception as e:
+                    logging.error(f"Error saving/sending collage: {e}")
+                    bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
+            else:
+                bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
 
         # Оценка анализа
         markup_rate = types.InlineKeyboardMarkup(row_width=5)
@@ -150,21 +172,6 @@ def handle_photo(message):
     except Exception as e:
         logging.error(f"Error processing photo: {e}")
         bot.reply_to(message, "⚠ Произошла ошибка при обработке изображения. Пожалуйста, попробуйте позже.")
-
-
-@bot.message_handler(func=lambda m: m.text == "ℹ️ Справка")
-def send_help(message):
-    help_text = (
-        "📌 *Как работает бот?*\n"
-        "1. Вы отправляете фото УЗИ щитовидной железы.\n"
-        "2. Бот обрабатывает изображение с помощью ИИ или по шкале ACR TI-RADS.\n"
-        "3. Вы получаете результат с визуализацией.\n\n"
-        "🔍 *AI-анализ* использует модель Mask R-CNN для выделения тканей.\n"
-        "📊 *ACR TI-RADS* — система оценки риска злокачественности.\n"
-        "🟢 Зелёным цветом отмечена сонная артерия, если она была найдена.\n"
-        "🟣 Фиолетовым — ткань щитовидной железы."
-    )
-    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('rate_'))
@@ -258,6 +265,152 @@ def handle_tirads_after_ai(message, scan_id):
         bot.send_message(message.chat.id, "👌 Хорошо, пропускаем дополнительный анализ.")
 
 
+def create_collage(original_image_path, cropped_image_with_nodule_path):
+    try:
+        original_img = Image.open(original_image_path)
+        nodule_img = Image.open(cropped_image_with_nodule_path)
+
+        border_size = 40
+        padding_color = (255, 255, 255)
+        text_padding = 30
+        title_height = 80
+        caption_height = 80
+
+        scale_factor = 0.8
+        nodule_img = nodule_img.resize(
+            (int(nodule_img.width * scale_factor), int(nodule_img.height * scale_factor)),
+            Image.Resampling.LANCZOS
+        )
+
+        max_img_height = max(original_img.height, nodule_img.height) + border_size * 2
+
+        original_with_border = ImageOps.expand(original_img, border=border_size, fill=padding_color)
+        nodule_with_border = ImageOps.expand(nodule_img, border=border_size, fill=padding_color)
+
+        def add_vertical_padding(img, target_height):
+            current_height = img.height
+            if current_height < target_height:
+                top_pad = (target_height - current_height) // 2
+                bottom_pad = target_height - current_height - top_pad
+                return ImageOps.expand(img, border=(0, top_pad, 0, bottom_pad), fill=padding_color)
+            return img
+
+        original_with_border = add_vertical_padding(original_with_border, max_img_height)
+        nodule_with_border = add_vertical_padding(nodule_with_border, max_img_height)
+
+        collage_width = original_with_border.width + nodule_with_border.width
+        collage_height = title_height + max_img_height + caption_height
+        collage = Image.new('RGB', (collage_width, collage_height), color=padding_color)
+
+        collage.paste(original_with_border, (0, title_height))
+        collage.paste(nodule_with_border, (original_with_border.width, title_height))
+
+        draw = ImageDraw.Draw(collage)
+
+        font = ImageFont.truetype("arial.ttf", 24)
+        font_large = ImageFont.truetype("arial.ttf", 28)
+
+        title = "Результаты анализа УЗИ щитовидной железы"
+        title_width = draw.textlength(title, font=font_large)
+        draw.text(
+            (collage.width // 2 - title_width // 2, title_height // 2 - 15),
+            title, fill="black", font=font_large
+        )
+
+        left_text_line1 = "Обнаруженные щитовидная железа"
+        left_text_line2 = "и сонная артерия"
+
+        left_text_width1 = draw.textlength(left_text_line1, font=font)
+        left_text_width2 = draw.textlength(left_text_line2, font=font)
+
+        draw.text(
+            (original_with_border.width // 2 - left_text_width1 // 2,
+             title_height + max_img_height + 10),
+            left_text_line1, fill="black", font=font
+        )
+        draw.text(
+            (original_with_border.width // 2 - left_text_width2 // 2,
+             title_height + max_img_height + 40),
+            left_text_line2, fill="black", font=font
+        )
+
+        right_text = "Обнаруженный узел"
+        right_text_width = draw.textlength(right_text, font=font)
+        draw.text(
+            (original_with_border.width + nodule_with_border.width // 2 - right_text_width // 2,
+             title_height + max_img_height + 25),
+            right_text, fill="black", font=font
+        )
+
+        return collage
+
+    except Exception as e:
+        logging.error(f"Error creating collage: {e}")
+        return None
+
+
+def create_single_image_collage(original_image_path):
+    try:
+        original_img = Image.open(original_image_path)
+        border_size = 40
+        padding_color = (255, 255, 255)
+        text_padding = 30
+        title_height = 100
+        caption_height = 120
+
+        img_with_border = ImageOps.expand(original_img, border=border_size, fill=padding_color)
+
+        collage_width = img_with_border.width + 2 * border_size
+        collage_height = title_height + img_with_border.height + caption_height
+        collage = Image.new('RGB', (collage_width, collage_height), color=padding_color)
+
+        collage.paste(img_with_border, (border_size, title_height))
+
+        draw = ImageDraw.Draw(collage)
+
+        font = ImageFont.truetype("arial.ttf", 24)
+        font_large = ImageFont.truetype("arial.ttf", 28)
+
+        title = "Результаты анализа УЗИ щитовидной железы"
+        title_width = draw.textlength(title, font=font_large)
+        draw.text(
+            (collage.width // 2 - title_width // 2, title_height // 2 - 15),
+            title, fill="black", font=font_large
+        )
+
+        text_line1 = "Обнаруженные щитовидная железа"
+        text_line2 = "и сонная артерия"
+        text_line3 = "Узлы не обнаружены"
+
+        text_y_start = title_height + img_with_border.height + 10
+        line_spacing = 30
+
+        text_width = draw.textlength(text_line1, font=font)
+        draw.text(
+            (collage.width // 2 - text_width // 2, text_y_start),
+            text_line1, fill="black", font=font
+        )
+
+        text_width = draw.textlength(text_line2, font=font)
+        draw.text(
+            (collage.width // 2 - text_width // 2, text_y_start + line_spacing),
+            text_line2, fill="black", font=font
+        )
+
+        text_width = draw.textlength(text_line3, font=font)
+        draw.text(
+            (collage.width // 2 - text_width // 2, text_y_start + 2 * line_spacing),
+            text_line3, fill="red", font=font
+        )
+
+        return collage
+
+    except Exception as e:
+        logging.error(f"Error creating single image collage: {e}")
+        return None
+
+
 if __name__ == '__main__':
+    bot.delete_webhook()
     print("Бот запущен...")
     bot.polling(none_stop=True)
