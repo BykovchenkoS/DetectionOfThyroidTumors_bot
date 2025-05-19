@@ -73,10 +73,13 @@ def handle_photo(message):
             (message.from_user.id, original_path, analysis_type)
         )
 
-        # Обработка изображения нейросетью
-        result_buffer = processor_mask_rcnn.process_image(original_path)
-        if result_buffer is None:
+        # Обработка изображения Mask R-CNN
+        result_buffer, prediction_dict, combined_cropped_path = processor_mask_rcnn.process_image(original_path)
+
+        if result_buffer is None or prediction_dict is None:
             raise Exception("Не удалось обработать изображение")
+
+        img = Image.open(original_path).convert("RGB")
 
         processed_filename = f"processed_{original_filename}"
         processed_path = os.path.join('user_scans', 'processed', processed_filename)
@@ -90,32 +93,32 @@ def handle_photo(message):
         )
 
         # Определяем, был ли найден Carotis
-        found_classes = set()
-
-        img = Image.open(original_path).convert("RGB")
-        img_tensor = processor_mask_rcnn._transform(img).unsqueeze(0).to(processor_mask_rcnn.device)
-
-        with torch.no_grad():
-            predictions = processor_mask_rcnn.model(img_tensor)[0]
-
-        labels = predictions['labels'].cpu().numpy()
-        scores = predictions['scores'].cpu().numpy()
+        labels = prediction_dict['labels'].cpu().numpy()
+        scores = prediction_dict['scores'].cpu().numpy()
         keep = scores >= 0.5
         detected_labels = labels[keep]
 
+        found_classes = set()
         for label in detected_labels:
             class_name = processor_mask_rcnn.class_names[label]
             found_classes.add(class_name)
 
-        caption = "🧠 AI-анализ завершён\nНа изображении выделены:\n"
-        caption += "- 🟣 Щитовидная железа\n"
+        # Обрезаем изображение по объединённой области Thyroid + Carotis
+        combined_cropped_path = processor_mask_rcnn._crop_combined_thyroid_carotis(img, prediction_dict, original_path)
 
+        caption = "AI-анализ завершён🧠\n\nНа изображении выделены:\n"
+        caption += "🟣 Щитовидная железа\n"
         if 'Carotis' in found_classes:
-            caption += "- 🟢 Сонная артерия\n"
+            caption += "🟢 Сонная артерия\n"
 
         with open(processed_path, 'rb') as photo:
             bot.send_photo(message.chat.id, photo, caption=caption.strip())
 
+        # Если есть обрезанное изображение, сохраняем его для дальнейшей работы
+        if combined_cropped_path:
+            print(f"[DEBUG] Обрезанное изображение сохранено: {combined_cropped_path}")
+
+        # Оценка анализа
         markup_rate = types.InlineKeyboardMarkup(row_width=5)
         markup_rate.add(
             types.InlineKeyboardButton("1", callback_data=f"rate_{scan_id}_1"),

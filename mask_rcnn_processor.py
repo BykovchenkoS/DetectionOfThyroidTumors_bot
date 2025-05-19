@@ -1,3 +1,6 @@
+import os
+from datetime import datetime
+from io import BytesIO
 import cv2
 import torch
 import torchvision
@@ -33,6 +36,45 @@ class MaskRCNNThyroidAnalyzer:
         transform = torchvision.transforms.ToTensor()
         return transform(image)
 
+    def _crop_combined_thyroid_carotis(self, pil_image, predictions, image_path):
+        boxes = predictions['boxes'].cpu().numpy()
+        labels = predictions['labels'].cpu().numpy()
+        scores = predictions['scores'].cpu().numpy()
+        keep = scores >= 0.5
+
+        boxes = boxes[keep]
+        labels = labels[keep]
+
+        all_coords = []
+        for box, label in zip(boxes, labels):
+            if self.class_names[label] in ['Thyroid tissue', 'Carotis']:
+                x1, y1, x2, y2 = map(int, box)
+                all_coords.append((x1, y1, x2, y2))
+
+        if not all_coords:
+            print("Не найдены объекты Thyroid tissue или Carotis")
+            return None
+
+        min_x = min(box[0] for box in all_coords)
+        min_y = min(box[1] for box in all_coords)
+        max_x = max(box[2] for box in all_coords)
+        max_y = max(box[3] for box in all_coords)
+
+        img_array = np.array(pil_image)
+        cropped_img = img_array[min_y:max_y, min_x:max_x]
+
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = 'cropped_regions'
+        os.makedirs(output_dir, exist_ok=True)
+
+        save_path = os.path.join(output_dir, f"thyroid_carotis_{base_name}_{timestamp}.jpg")
+
+        cropped_pil = Image.fromarray(cropped_img)
+        cropped_pil.save(save_path)
+
+        return save_path
+
     def process_image(self, image_path):
         try:
             img = Image.open(image_path).convert("RGB")
@@ -41,16 +83,19 @@ class MaskRCNNThyroidAnalyzer:
             with torch.no_grad():
                 predictions = self.model(img_tensor)
 
-            result_image = self._visualize_predictions(img, predictions[0])
-            from io import BytesIO
+            prediction_dict = predictions[0]
+            result_image = self._visualize_predictions(img, prediction_dict)
+
             buf = BytesIO()
             result_image.save(buf, format='PNG')
             buf.seek(0)
-            return buf
+            combined_cropped_path = self._crop_combined_thyroid_carotis(img, prediction_dict, image_path)
+
+            return buf, prediction_dict, combined_cropped_path
 
         except Exception as e:
             print(f"Error processing image: {e}")
-            return None
+            return None, None, None
 
     def _visualize_predictions(self, image, predictions, threshold=0.5):
         boxes = predictions['boxes'].cpu().numpy()
