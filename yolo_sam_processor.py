@@ -23,7 +23,21 @@ class YOLOSAMNodeAnalyzer:
 
         self.output_dir = "sam_predictions"
         os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "masks"), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, "binary_masks"), exist_ok=True)
+
+    def _save_binary_mask(self, mask, image_path, suffix=""):
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        mask_dir = os.path.join(self.output_dir, "binary_masks")
+        os.makedirs(mask_dir, exist_ok=True)
+
+        filename = f"{base_name}_binary_mask{suffix}.png"
+        save_path = os.path.join(mask_dir, filename)
+
+        binary_mask = (mask * 255).astype(np.uint8)
+        cv2.imwrite(save_path, binary_mask)
+
+        print(f"[DEBUG] Бинарная маска сохранена: {save_path}")
+        return save_path
 
     def run_yolo_on_image(self, image_path):
         results = self.yolo(image_path)
@@ -56,7 +70,7 @@ class YOLOSAMNodeAnalyzer:
 
         all_masks = []
 
-        for box in boxes:
+        for i, box in enumerate(boxes):
             bbox = box['bbox']
             input_box = np.array(bbox)
 
@@ -69,6 +83,8 @@ class YOLOSAMNodeAnalyzer:
 
             binary_mask = masks[0].astype(np.uint8)
             all_masks.append(binary_mask)
+
+            self._save_binary_mask(binary_mask, image_path, suffix=f"_{i}")
 
             mask_overlay = np.zeros_like(image_for_drawing)
             mask_overlay[binary_mask == 1] = [255, 0, 0]
@@ -105,10 +121,7 @@ class YOLOSAMNodeAnalyzer:
             )
 
         base_name = os.path.splitext(os.path.basename(image_path))[0]
-        output_dir = "sam_predictions"
-        os.makedirs(output_dir, exist_ok=True)
-
-        output_path = os.path.join(output_dir, f"{base_name}_mask.png")
+        output_path = os.path.join(self.output_dir, f"{base_name}_mask.png")
         plt.figure(figsize=(10, 10))
         plt.imshow(image_for_drawing)
         plt.axis("off")

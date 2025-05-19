@@ -21,10 +21,12 @@ class MaskRCNNThyroidAnalyzer:
 
         num_classes = len(self.class_names)
         in_features = model.roi_heads.box_predictor.cls_score.in_features
-        model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
+        model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features,
+                                                                                                   num_classes)
 
         in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-        model.roi_heads.mask_predictor = torchvision.models.detection.mask_rcnn.MaskRCNNPredictor(in_features_mask, 256, num_classes)
+        model.roi_heads.mask_predictor = torchvision.models.detection.mask_rcnn.MaskRCNNPredictor(in_features_mask, 256,
+                                                                                                  num_classes)
 
         model.load_state_dict(torch.load(model_path, map_location=self.device))
         model.to(self.device)
@@ -36,20 +38,39 @@ class MaskRCNNThyroidAnalyzer:
         transform = torchvision.transforms.ToTensor()
         return transform(image)
 
+    def _save_binary_mask(self, mask, class_name, base_path):
+        mask_dir = os.path.join(os.path.dirname(base_path), 'binary_masks')
+        os.makedirs(mask_dir, exist_ok=True)
+
+        filename = f"{os.path.splitext(os.path.basename(base_path))[0]}_{class_name.replace(' ', '_')}_mask.png"
+        save_path = os.path.join(mask_dir, filename)
+
+        binary_mask = (mask * 255).astype(np.uint8)
+        mask_image = Image.fromarray(binary_mask)
+        mask_image.save(save_path)
+
+        return save_path
+
     def _crop_combined_thyroid_carotis(self, pil_image, predictions, image_path):
         boxes = predictions['boxes'].cpu().numpy()
         labels = predictions['labels'].cpu().numpy()
         scores = predictions['scores'].cpu().numpy()
+        masks = predictions['masks'].cpu().numpy()
         keep = scores >= 0.5
 
         boxes = boxes[keep]
         labels = labels[keep]
+        masks = masks[keep]
 
         all_coords = []
-        for box, label in zip(boxes, labels):
+        for box, label, mask in zip(boxes, labels, masks):
             if self.class_names[label] in ['Thyroid tissue', 'Carotis']:
                 x1, y1, x2, y2 = map(int, box)
                 all_coords.append((x1, y1, x2, y2))
+
+                class_name = self.class_names[label]
+                binary_mask = (mask[0] > 0.5).astype(np.uint8)
+                self._save_binary_mask(binary_mask, class_name, image_path)
 
         if not all_coords:
             print("Не найдены объекты Thyroid tissue или Carotis")
