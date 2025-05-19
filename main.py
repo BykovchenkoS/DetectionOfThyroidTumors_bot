@@ -6,6 +6,7 @@ from telebot import types
 from config import TOKEN
 from database import db
 from mask_rcnn_processor import MaskRCNNThyroidAnalyzer
+from yolo_sam_processor import YOLOSAMNodeAnalyzer
 import torch
 from PIL import Image
 
@@ -106,7 +107,7 @@ def handle_photo(message):
         # Обрезаем изображение по объединённой области Thyroid + Carotis
         combined_cropped_path = processor_mask_rcnn._crop_combined_thyroid_carotis(img, prediction_dict, original_path)
 
-        caption = "AI-анализ завершён🧠\n\nНа изображении выделены:\n"
+        caption = "AI-анализ завершён 🧠\n\nНа изображении выделены:\n"
         caption += "🟣 Щитовидная железа\n"
         if 'Carotis' in found_classes:
             caption += "🟢 Сонная артерия\n"
@@ -117,6 +118,19 @@ def handle_photo(message):
         # Если есть обрезанное изображение, сохраняем его для дальнейшей работы
         if combined_cropped_path:
             print(f"[DEBUG] Обрезанное изображение сохранено: {combined_cropped_path}")
+
+            # Детекция узла через YOLO + SAM
+            yolo_sam_processor = YOLOSAMNodeAnalyzer(
+                yolo_weights_path='neural_networks/train8_node_yolo12/weights/best.pt',
+                sam_checkpoint_path='neural_networks/sam_vit_h_4b8939.pth',
+                sam_finetuned_path='neural_networks/sam_best_node.pth'
+            )
+
+            masks, mask_vis_path = yolo_sam_processor.process(combined_cropped_path)
+
+            if masks and mask_vis_path:
+                with open(mask_vis_path, 'rb') as mask_file:
+                    bot.send_photo(message.chat.id, mask_file, caption="🟢 Точный анализ узла завершён")
 
         # Оценка анализа
         markup_rate = types.InlineKeyboardMarkup(row_width=5)
