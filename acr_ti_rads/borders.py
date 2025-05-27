@@ -23,7 +23,7 @@ def analyze_boundary_intensity(image, boundary):
 def analyze_boundary_texture(image, boundary):
     gradient_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
     gradient_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
-    gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
+    gradient_magnitude = np.sqrt(gradient_x ** 2 + gradient_y ** 2)
     boundary_gradient = gradient_magnitude[boundary > 0]
     mean_gradient = np.mean(boundary_gradient)
     return mean_gradient
@@ -36,11 +36,14 @@ def analyze_contour_shape(mask):
     contour = max(contours, key=cv2.contourArea)
     perimeter = cv2.arcLength(contour, True)
     area = cv2.contourArea(contour)
-    compactness = (perimeter**2) / (4 * np.pi * area)
+    compactness = (perimeter ** 2) / (4 * np.pi * area)
     return compactness
 
 
 def determine_border_type_by_pixels(image, mask):
+    if image is None or mask is None:
+        raise ValueError("Изображение или маска не загружены")
+
     boundary = extract_boundary_pixels(mask)
 
     mean_intensity, std_intensity = analyze_boundary_intensity(image, boundary)
@@ -50,13 +53,13 @@ def determine_border_type_by_pixels(image, mask):
     print(f"std_intensity: {std_intensity}, mean_gradient: {mean_gradient}, compactness: {compactness}")
 
     if std_intensity < 30 and mean_gradient < 40 and compactness < 1.6:
-        return "Неявная"
+        return {"type": "Неявная", "points": 0}
     elif std_intensity < 35 and mean_gradient < 80 and compactness < 1.8:
-        return "Явная"
+        return {"type": "Явная", "points": 2}
     elif std_intensity < 45 and mean_gradient < 100 and compactness < 2.0:
-        return "Волнообразная (бугристая)"
+        return {"type": "Волнообразная (бугристая)", "points": 2}
     else:
-        return "Выпячивание из железы"
+        return {"type": "Выпячивание из железы", "points": 3}
 
 
 def get_tirads_border_info(border_type):
@@ -79,6 +82,10 @@ def get_tirads_border_info(border_type):
 
 
 def process_custom_image(image_path, mask_path):
+    if not isinstance(image_path, str) or not isinstance(mask_path, str):
+        print("Пути должны быть строками!")
+        return
+
     if not os.path.exists(image_path):
         print(f"Файл изображения не найден: {image_path}")
         return
@@ -89,14 +96,19 @@ def process_custom_image(image_path, mask_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
-    border_type = determine_border_type_by_pixels(image, mask)
+    if image is None or mask is None:
+        print("Ошибка при чтении файлов OpenCV")
+        return
+
+    border_info = determine_border_type_by_pixels(image, mask)
+    border_type = border_info['type']
 
     tirads_data = get_tirads_border_info(border_type)
 
     print("\nРезультат анализа")
     print(f"Тип границы узла: {border_type}")
     if tirads_data:
-        print(f"Соответствует TIRADS опции: {tirads_data['option_name']}")
+        print(f"\nСоответствует TIRADS опции: {tirads_data['option_name']}")
         print(f"Баллы: {tirads_data['points']}")
         print(f"Описание: {tirads_data['description']}")
     else:

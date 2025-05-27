@@ -7,34 +7,36 @@ from database import db
 
 
 def determine_node_position(mask):
+    if mask is None:
+        raise ValueError("Маска не была загружена корректно")
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     if not contours:
-        return "Контур узла не найден"
+        return {"type": "Контур не найден", "points": 0}
+
     contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(contour)
+    aspect_ratio = w / h
 
-    x, y, width, height = cv2.boundingRect(contour)
-    aspect_ratio = width / height
+    tirads_type = "Шире, чем выше" if aspect_ratio > 1 else "Выше, чем шире"
 
-    if aspect_ratio > 1:
-        return "Продольно доли (шире, чем выше)"
-    else:
-        return "Поперечно доли (выше, чем шире)"
+    query = """
+        SELECT * FROM tirads_options 
+        WHERE category = 'position' AND option_name = %s
+    """
+    result = db.fetch_one(query, (tirads_type,))
+    return {
+        "type": tirads_type,
+        "points": result["points"] if result else 0
+    }
 
 
 def get_tirads_position_info(position_type):
-    mapping = {
-        "Продольно доли (шире, чем выше)": "Шире, чем выше",
-        "Поперечно доли (выше, чем шире)": "Выше, чем шире"
-    }
-
-    db_option_name = mapping.get(position_type)
-    if not db_option_name:
-        return None
-
     query = """
         SELECT * FROM tirads_options WHERE category = 'position' AND option_name = %s
     """
-    result = db.fetch_one(query, (db_option_name,))
+    result = db.fetch_one(query, (position_type,))
     return result
 
 
@@ -49,19 +51,25 @@ def process_custom_image(image_path, mask_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
-    position_type = determine_node_position(mask)
+    if image is None or mask is None:
+        print("Ошибка: Не удалось загрузить изображение или маску.")
+        return
+
+    position_result = determine_node_position(mask)
+    position_type = position_result["type"]
+
     tirads_data = get_tirads_position_info(position_type)
 
     print("\nРезультат анализа положения:")
     print(f"Тип положения: {position_type}")
+
     if tirads_data:
-        print(f"Соответствует TIRADS опции: {tirads_data['option_name']}")
+        print(f"\nСоответствует TIRADS опции: {tirads_data['option_name']}")
         print(f"Баллы: {tirads_data['points']}")
         print(f"Описание: {tirads_data['description']}")
     else:
         print("Не удалось сопоставить с TIRADS.")
 
-    # Визуализация
     plt.figure(figsize=(10, 5))
 
     plt.subplot(1, 2, 1)

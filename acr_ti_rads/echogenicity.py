@@ -6,22 +6,22 @@ import os
 from database import db
 
 
-def determine_echogenicity(image_path, mask_path):
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+def determine_echogenicity(image, mask):
+    if image is None or mask is None:
+        raise ValueError("Не удалось загрузить изображение или маску")
 
     masked_image = cv2.bitwise_and(image, image, mask=mask)
 
     mean_intensity = np.mean(masked_image[mask > 0])
 
     if mean_intensity > 180:
-        return "Гиперэхогенный"
+        return {"type": "Гиперэхогенный", "points": 1}
     elif mean_intensity > 120:
-        return "Изоэхогенный"
+        return {"type": "Изоэхогенный", "points": 1}
     elif mean_intensity > 60:
-        return "Гипоэхогенный"
+        return {"type": "Гипоэхогенный", "points": 2}
     else:
-        return "Анэхогенный"
+        return {"type": "Анэхогенный", "points": 0}
 
 
 def get_tirads_echogenicity_info(echogenicity_type):
@@ -56,14 +56,19 @@ def process_custom_image(image_path, mask_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
-    echogenicity_type = determine_echogenicity(image_path, mask_path)
+    if image is None or mask is None:
+        print("Ошибка: Не удалось загрузить изображение или маску.")
+        return
+
+    echogenicity_result = determine_echogenicity(image, mask)
+    echogenicity_type = echogenicity_result["type"]
 
     tirads_data = get_tirads_echogenicity_info(echogenicity_type)
 
     print("\nРезультат анализа эхогенности:")
     print(f"Тип эхогенности: {echogenicity_type}")
     if tirads_data:
-        print(f"Соответствует TIRADS опции: {tirads_data['option_name']}")
+        print(f"\nСоответствует TIRADS опции: {tirads_data['option_name']}")
         print(f"Баллы: {tirads_data['points']}")
         print(f"Описание: {tirads_data['description']}")
     else:
