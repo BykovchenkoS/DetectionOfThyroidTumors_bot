@@ -21,6 +21,8 @@ processor_mask_rcnn = MaskRCNNThyroidAnalyzer(MODEL_PATH)
 os.makedirs('user_scans/original', exist_ok=True)
 os.makedirs('user_scans/processed', exist_ok=True)
 
+user_context = {}
+
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -51,6 +53,21 @@ def request_ai_scan(message):
 
 @bot.message_handler(func=lambda m: m.text == "Оценка по ACR TI-RADS📊")
 def request_tirads_scan(message):
+    try:
+        scan_id = db.execute_query(
+            "INSERT INTO scans (user_id, analysis_type) VALUES (%s, %s)",
+            (message.from_user.id, 'tirads')
+        )
+
+        user_context[message.from_user.id] = {
+            'scan_id': scan_id,
+            'analysis_type': 'tirads'
+        }
+    except Exception as e:
+        logging.error(f"Ошибка при создании записи для ACR TI-RADS: {e}")
+        bot.reply_to(message, "⚠ Не удалось подготовить анализ. Попробуйте снова.")
+        return
+
     bot.send_message(message.chat.id,
                      "📤 Отправьте фото УЗИ щитовидной железы для анализа по шкале ACR TI-RADS. Убедитесь, что снимок четкий и захватывает всю область.")
 
@@ -69,15 +86,23 @@ def handle_photo(message):
             new_file.write(downloaded_file)
 
         analysis_type = 'ai'
-        if message.reply_to_message and message.reply_to_message.text.startswith("Отправьте фото УЗИ"):
-            analysis_type = 'ai' if "AI-анализа" in message.reply_to_message.text else 'ti-rads'
+        scan_id = None
 
-        scan_id = db.execute_query(
-            "INSERT INTO scans (user_id, original_filepath, analysis_type) VALUES (%s, %s, %s)",
-            (message.from_user.id, original_path, analysis_type)
-        )
+        if message.from_user.id in user_context:
+            scan_id = user_context[message.from_user.id]['scan_id']
+            analysis_type = user_context[message.from_user.id]['analysis_type']
+            del user_context[message.from_user.id]
 
-        # Обработка изображения Mask R-CNN
+        if not scan_id:
+            scan_id = db.execute_query(
+                "INSERT INTO scans (user_id, original_filepath, analysis_type) VALUES (%s, %s, %s)",
+                (message.from_user.id, original_path, analysis_type)
+            )
+        else:
+            db.execute_query(
+                "UPDATE scans SET original_filepath=%s WHERE scan_id=%s",
+                (original_path, scan_id)
+            )
         result_buffer, prediction_dict, combined_cropped_path = processor_mask_rcnn.process_image(original_path)
 
         if result_buffer is None or prediction_dict is None:
