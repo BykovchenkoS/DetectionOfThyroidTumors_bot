@@ -136,7 +136,7 @@ class YOLOSAMNodeAnalyzer:
 
         if not boxes:
             print("[INFO] Узлы не найдены YOLO.")
-            return None, None
+            return None, None, None
 
         sorted_boxes = sorted(boxes, key=lambda x: x['conf'], reverse=True)
 
@@ -147,4 +147,6 @@ class YOLOSAMNodeAnalyzer:
         print(f"[DEBUG] Точная сегментация через SAM...")
         masks, mask_vis_path = self.run_sam_with_boxes(cropped_image_path, [best_box])
 
-        return masks, mask_vis_path
+        binary_mask_path = self._save_binary_mask(masks[0], cropped_image_path, suffix="_0")
+
+        return masks, mask_vis_path, binary_mask_path

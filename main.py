@@ -12,7 +12,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import time
 from threading import Timer
-
+from tirads_analyzer import run_tirads_analysis, save_tirads_result_to_db
 
 bot = telebot.TeleBot(TOKEN)
 MODEL_PATH = 'neural_networks/mask_rcnn_model_screen.pth'
@@ -157,9 +157,19 @@ def handle_photo(message):
                     sam_checkpoint_path='neural_networks/sam_vit_h_4b8939.pth',
                     sam_finetuned_path='neural_networks/sam_best_node.pth'
                 )
-                masks, mask_vis_path = yolo_sam_processor.process(combined_cropped_path)
+                masks, mask_vis_path, binary_mask_path = yolo_sam_processor.process(combined_cropped_path)
+
+                db.execute_query(
+                    "UPDATE scans SET cropped_filepath=%s WHERE scan_id=%s",
+                    (combined_cropped_path, scan_id)
+                )
 
                 if masks and mask_vis_path:
+                    db.execute_query(
+                        "UPDATE scans SET mask_filepath=%s, mask_binary_filepath=%s WHERE scan_id=%s",
+                        (mask_vis_path, binary_mask_path, scan_id)
+                    )
+
                     with open(mask_vis_path, 'rb') as mask_file:
                         sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
                         messages_to_delete.append(sent_msg.message_id)
@@ -253,6 +263,11 @@ def handle_photo(message):
                 masks, mask_vis_path = yolo_sam_processor.process(combined_cropped_path)
 
                 if masks and mask_vis_path:
+                    db.execute_query(
+                        "UPDATE scans SET mask_filepath=%s WHERE scan_id=%s",
+                        (mask_vis_path, scan_id)
+                    )
+
                     with open(mask_vis_path, 'rb') as mask_file:
                         sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
                         messages_to_delete.append(sent_msg.message_id)
@@ -297,46 +312,96 @@ def handle_photo(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('tirads_composition_'))
 def process_tirads_composition_callback(call):
     try:
-        scan_id = int(call.data.split('_')[-1])
-        composition_key = '_'.join(call.data.split('_')[2:-1])  # Получаем ключ типа состава
+        parts = call.data.split('_')
+        composition_key = '_'.join(parts[2:-1])
+        scan_id = int(parts[-1])
 
-        composition_map = {
-            'cystic': 'Cystic',
-            'nearly_cystic': 'Nearly Cystic',
-            'microcystic': 'Microcystic',
-            'mixed': 'Mixed',
-            'solid': 'Solid',
-            'nearly_solid': 'Nearly Solid'
-        }
-
-        composition_rus = {
+        COMPOSITION_MAP = {
             'cystic': 'Кистозный',
             'nearly_cystic': 'Почти полностью кистозный',
-            'microcystic': 'Микрокистозный',
+            'microcystic': 'Губчатый',
             'mixed': 'Смешанный - кистозный и тканевой',
             'solid': 'Тканевой',
             'nearly_solid': 'Почти полностью тканевой'
         }
 
-        composition_label = composition_map.get(composition_key)
-        if not composition_label:
-            raise ValueError(f"Неизвестный тип состава узла: {composition_key}")
+        COMPOSITION_POINTS_MAP = {
+            'cystic': 0,
+            'nearly_cystic': 0,
+            'microcystic': 0,
+            'mixed': 1,
+            'solid': 2,
+            'nearly_solid': 2
+        }
 
-        # Сохраняем выбор в БД
-        db.execute_query(
-            "UPDATE scans SET nodule_composition=%s WHERE scan_id=%s",
-            (composition_label, scan_id)
-        )
+        ru_composition = COMPOSITION_MAP.get(composition_key)
+        if not ru_composition:
+            bot.send_message(call.message.chat.id, "❌ Неизвестный тип состава.")
+            return
 
-        bot.edit_message_text(
-            f"✅ Вы выбрали: *{composition_rus[composition_key]}*",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode='Markdown'
-        )
+        scan = db.fetch_one("SELECT * FROM scans WHERE scan_id = %s", (scan_id,))
+
+        if not scan:
+            bot.send_message(call.message.chat.id, "❌ Не найден скан для анализа.")
+            return
+
+        if not scan['mask_filepath']:
+            bot.send_message(call.message.chat.id, "❌ Не найдена маска узла для анализа.")
+            return
+
+        composition_points = COMPOSITION_POINTS_MAP.get(composition_key, 0)
+
+        print("\n[DEBUG] Пути для ACR TI-RADS анализа:")
+        print(f"Image path: {scan['cropped_filepath']}")
+        print(f"Mask path:  {scan['mask_binary_filepath']}")
+        print(f"Composition points: {composition_points}\n")
+
+        try:
+            analysis_result = run_tirads_analysis(
+                image_path=scan['cropped_filepath'],
+                mask_path=scan['mask_binary_filepath'],
+                composition_points=composition_points
+            )
+
+            save_tirads_result_to_db(scan_id, analysis_result)
+
+            result_text = (
+                "📊 *Результат анализа* 📊\n\n"
+                f"🔹 Категория: {analysis_result['category']}\n"
+                f"🔹 Риск злокачественности: {analysis_result['risk']}\n"
+                f"🔹 Общий балл: {analysis_result['total_score']}\n\n"
+                f"📝 *Описание узла:*\n{analysis_result['description']}\n\n"
+            )
+
+            bot.edit_message_text(
+                f"Вы выбрали: *{ru_composition}*",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode='Markdown'
+            )
+
+            bot.send_message(call.message.chat.id, result_text, parse_mode='Markdown')
+
+            markup_rate = types.InlineKeyboardMarkup(row_width=5)
+            markup_rate.add(
+                types.InlineKeyboardButton("1", callback_data=f"rate_{scan_id}_1"),
+                types.InlineKeyboardButton("2", callback_data=f"rate_{scan_id}_2"),
+                types.InlineKeyboardButton("3", callback_data=f"rate_{scan_id}_3"),
+                types.InlineKeyboardButton("4", callback_data=f"rate_{scan_id}_4"),
+                types.InlineKeyboardButton("5", callback_data=f"rate_{scan_id}_5")
+            )
+            bot.send_message(
+                call.message.chat.id,
+                "⭐️ Оцените качество анализа ⭐️",
+                reply_markup=markup_rate
+            )
+
+        except Exception as e:
+            logging.error(f"Ошибка при выполнении TI-RADS анализа: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, "⚠ Произошла ошибка при выполнении анализа. Попробуйте снова.")
 
     except Exception as e:
-        logging.error(f"Ошибка при обработке состава узла: {e}")
+        logging.error(f"Ошибка при обработке состава узла: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "⚠ Ошибка обработки данных")
 
 
