@@ -49,8 +49,10 @@ def send_welcome(message):
 
 @bot.message_handler(func=lambda m: m.text == "Анализ снимка (AI) 🔍")
 def request_ai_scan(message):
-    bot.send_message(message.chat.id,
-                     "📤 Отправьте фото УЗИ щитовидной железы для AI-анализа. Убедитесь, что снимок четкий и захватывает всю область.")
+    bot.send_message(
+        message.chat.id,
+        "📤 Отправьте фото УЗИ щитовидной железы для AI-анализа. Убедитесь, что снимок четкий и захватывает всю область."
+    )
 
 
 @bot.message_handler(func=lambda m: m.text == "Оценка по ACR TI-RADS📊")
@@ -139,11 +141,21 @@ def handle_collage(bot, chat_id, processed_path, mask_vis_path, timestamp, messa
 
 def process_ai_analysis(message, scan_id, original_path, original_filename, timestamp):
     try:
-        prediction_dict, combined_cropped_path, processed_path, timestamp_func = process_and_save_image(original_path, scan_id)
+        prediction_dict, combined_cropped_path, processed_path, _ = process_and_save_image(original_path, scan_id)
 
         labels = prediction_dict['labels'].cpu().numpy()
         scores = prediction_dict['scores'].cpu().numpy()
         found_classes = {processor_mask_rcnn.class_names[label] for label in labels[scores >= 0.5]}
+
+        if 'Thyroid tissue' not in found_classes and 'Carotis' not in found_classes:
+            logging.info("Объекты 'Thyroid tissue' или 'Carotis' не найдены")
+            bot.send_message(message.chat.id, "❌ Объекты не обнаружены. Попробуйте отправить другое изображение.")
+            bot.send_message(
+                message.chat.id,
+                "📤 Отправьте фото УЗИ щитовидной железы для AI-анализа. Убедитесь, что снимок четкий и захватывает всю область."
+            )
+            return
+
         caption = generate_caption(found_classes)
 
         messages_to_delete = []
@@ -151,11 +163,28 @@ def process_ai_analysis(message, scan_id, original_path, original_filename, time
 
         if combined_cropped_path:
             masks, mask_vis_path = detect_nodule(combined_cropped_path, scan_id)
+
             db.execute_query(
                 "UPDATE scans SET mask_filepath=%s WHERE scan_id=%s",
                 (mask_vis_path, scan_id)
             )
-            handle_collage(bot, message.chat.id, processed_path, mask_vis_path, timestamp, messages_to_delete)
+
+            if masks and mask_vis_path:
+                with open(mask_vis_path, 'rb') as mask_file:
+                    sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
+                    messages_to_delete.append(sent_msg.message_id)
+                collage = create_collage(processed_path, mask_vis_path)
+                caption = "✅ AI-анализ выполнен"
+            else:
+                collage = create_single_image_collage(processed_path)
+                caption = "❌ Узлы не найдены"
+
+            if collage:
+                collage_path = os.path.join('user_scans', 'processed', f"collage_{timestamp}.png")
+                collage.save(collage_path)
+                with open(collage_path, 'rb') as collage_file:
+                    sent_msg = bot.send_photo(message.chat.id, collage_file, caption=caption)
+                Timer(5.0, delete_messages, args=[message.chat.id, messages_to_delete]).start()
 
         markup_rate = types.InlineKeyboardMarkup(row_width=5)
         markup_rate.add(*[types.InlineKeyboardButton(str(i), callback_data=f"rate_{scan_id}_{i}") for i in range(1, 6)])
