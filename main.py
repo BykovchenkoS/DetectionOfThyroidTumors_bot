@@ -424,15 +424,14 @@ def handle_rating(call):
             call.message.message_id
         )
 
-        if analysis_type == 'ai':
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-            markup.add(types.KeyboardButton("Да"), types.KeyboardButton("Нет"))
-            msg = bot.send_message(
-                call.message.chat.id,
-                "🔁 Хотите также провести оценку этого снимка по шкале ACR TI-RADS?",
-                reply_markup=markup
-            )
-            bot.register_next_step_handler(msg, lambda m: handle_tirads_after_ai(m, scan_id))
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(types.KeyboardButton("Да"), types.KeyboardButton("Нет"))
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🔁 Хотите проанализировать ещё один снимок?",
+            reply_markup=markup
+        )
+        bot.register_next_step_handler(msg, lambda m: ask_another_analysis(m))
 
     except ValueError as e:
         logging.error(f"Invalid rating value: {e}")
@@ -440,6 +439,26 @@ def handle_rating(call):
     except Exception as e:
         logging.error(f"Error saving rating: {e}")
         bot.answer_callback_query(call.id, "⚠ Ошибка сохранения, попробуйте позже.")
+
+
+def ask_another_analysis(message):
+    if message.text.lower() == 'да':
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(
+            types.KeyboardButton("Анализ снимка (AI) 🔍"),
+            types.KeyboardButton("Оценка по ACR TI-RADS📊")
+        )
+        bot.send_message(
+            message.chat.id,
+            "📤 Выберите тип анализа:",
+            reply_markup=markup
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            "👋 Благодарим за использование системы. До новых встреч!",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
 
 
 def handle_tirads_after_ai(message, scan_id):
