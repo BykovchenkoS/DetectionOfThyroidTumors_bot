@@ -13,6 +13,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 import time
 from threading import Timer
 from tirads_analyzer import run_tirads_analysis, save_tirads_result_to_db
+import cv2
+import numpy as np
 
 bot = telebot.TeleBot(TOKEN)
 MODEL_PATH = 'neural_networks/mask_rcnn_model_screen.pth'
@@ -82,8 +84,21 @@ def handle_photo(message):
         original_filename = f"{message.from_user.id}_{timestamp}.{file_ext}"
         original_path = os.path.join('user_scans', 'original', original_filename)
 
-        with open(original_path, 'wb') as new_file:
-            new_file.write(downloaded_file)
+        nparr = np.frombuffer(downloaded_file, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise ValueError("Не удалось декодировать изображение")
+
+        # Проверяем размер и при необходимости делаем resize с padding
+        target_size = (528, 528)
+        if img.shape[0] != target_size[1] or img.shape[1] != target_size[0]:
+            print(f"[INFO] Изменяем размер изображения с {img.shape[1]}x{img.shape[0]} до {target_size}")
+            padded_img, _, _, _, _ = resize_with_padding(img, target_size=target_size)
+        else:
+            padded_img = img
+
+        cv2.imwrite(original_path, padded_img)
 
         analysis_type = 'ai'
         scan_id = None
@@ -260,7 +275,7 @@ def handle_photo(message):
                     sam_checkpoint_path='neural_networks/sam_vit_h_4b8939.pth',
                     sam_finetuned_path='neural_networks/sam_best_node.pth'
                 )
-                masks, mask_vis_path = yolo_sam_processor.process(combined_cropped_path)
+                masks, mask_vis_path, binary_mask_path = yolo_sam_processor.process(combined_cropped_path)
 
                 if masks and mask_vis_path:
                     db.execute_query(
@@ -651,6 +666,23 @@ def create_single_image_collage(original_image_path):
     except Exception as e:
         logging.error(f"Error creating single image collage: {e}")
         return None
+
+
+def resize_with_padding(image, target_size=(528, 528), pad_color=(0, 0, 0)):
+    old_h, old_w = image.shape[:2]
+    target_w, target_h = target_size
+
+    scale = min(target_w / old_w, target_h / old_h)
+    new_w, new_h = int(old_w * scale), int(old_h * scale)
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    delta_w = target_w - new_w
+    delta_h = target_h - new_h
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
+    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=pad_color)
+
+    return padded, scale, scale, left, top
 
 
 if __name__ == '__main__':
