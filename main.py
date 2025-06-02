@@ -174,10 +174,10 @@ def handle_photo(message):
                         sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
                         messages_to_delete.append(sent_msg.message_id)
                     collage = create_collage(processed_path, mask_vis_path)
-                    caption = "✅ AI-анализ выполнен"
+                    caption = "Объекты найдены, перехожу к оценке по ACR TI-RADS 🩺"
                 else:
                     collage = create_single_image_collage(processed_path)
-                    caption = "✅ AI-анализ выполнен"
+                    caption = "Узлы не найдены, попробуйте снова 🔁"
 
                 if collage:
                     collage_path = os.path.join('user_scans', 'processed', f"collage_{timestamp}.png")
@@ -371,6 +371,7 @@ def process_tirads_composition_callback(call):
                 f"🔹 Риск злокачественности: {analysis_result['risk']}\n"
                 f"🔹 Общий балл: {analysis_result['total_score']}\n\n"
                 f"📝 *Описание узла:*\n{analysis_result['description']}\n\n"
+                f"📝 *Рекомендации:*\n{analysis_result['recommendation']}\n\n"
             )
 
             bot.edit_message_text(

@@ -48,8 +48,9 @@ def save_tirads_result_to_db(scan_id, tirads_result):
                 total_score,
                 category,
                 malignancy_risk,
-                description
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                description,
+                recommendation
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 scan_id,
@@ -61,7 +62,8 @@ def save_tirads_result_to_db(scan_id, tirads_result):
                 tirads_result['total_score'],
                 tirads_result['category'],
                 tirads_result['risk'],
-                tirads_result['description']
+                tirads_result['description'],
+                tirads_result['recommendation']
             )
         )
         logging.info(f"Результат ACR TI-RADS успешно сохранён в БД (result_id={result})")
@@ -131,35 +133,35 @@ def calculate_tirads_score(features):
         tirads_data.update({
             "category": "TR1",
             "risk": "Доброкачественно",
-            # "recommendation": "Без Тонкоигольной Аспирационной Биопсии (ТАБ)."
+            "recommendation": "Без Тонкоигольной Аспирационной Биопсии (ТАБ)."
         })
 
     elif total_score == 1:
         tirads_data.update({
             "category": "TR2",
             "risk": "Не злокачественно",
-            # "recommendation": "Без Тонкоигольной Аспирационной Биопсии (ТАБ)."
+            "recommendation": "Без Тонкоигольной Аспирационной Биопсии (ТАБ)."
         })
 
     elif total_score == 2:
         tirads_data.update({
             "category": "TR3",
             "risk": "Вероятность рака мала",
-            # "recommendation": "Тонкоигольная Аспирационная Биопсия (ТАБ) если размер ≥ 2.5 см.\nКонтроль при размере ≥ 1.5 см."
+            "recommendation": "Тонкоигольная Аспирационная Биопсия (ТАБ) если размер ≥ 2.5 см.\nКонтроль при размере ≥ 1.5 см."
         })
 
     elif 3 <= total_score <= 6:
         tirads_data.update({
             "category": "TR4",
             "risk": "Вероятность рака умеренная",
-            # "recommendation": "Тонкоигольная Аспирационная Биопсия (ТАБ) если размер ≥ 1.5 см.\nКонтроль при размере ≥ 1 см."
+            "recommendation": "Тонкоигольная Аспирационная Биопсия (ТАБ) если размер ≥ 1.5 см.\nКонтроль при размере ≥ 1 см."
         })
 
     else:
         tirads_data.update({
             "category": "TR5",
             "risk": "Вероятность рака значительная",
-            # "recommendation": "Тонкоигольная Аспирационная Биопсия (ТАБ) если размер ≥ 1 см.\nКонтроль при размере ≥ 0.5 см."
+            "recommendation": "Тонкоигольная Аспирационная Биопсия (ТАБ) если размер ≥ 1 см.\nКонтроль при размере ≥ 0.5 см."
         })
 
     return tirads_data
