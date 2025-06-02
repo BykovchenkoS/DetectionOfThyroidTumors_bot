@@ -143,6 +143,14 @@ def process_ai_analysis(message, scan_id, original_path, original_filename, time
     try:
         prediction_dict, combined_cropped_path, processed_path, _ = process_and_save_image(original_path, scan_id)
 
+        if combined_cropped_path and os.path.exists(combined_cropped_path):
+            db.execute_query(
+                "UPDATE scans SET cropped_filepath=%s WHERE scan_id=%s",
+                (combined_cropped_path, scan_id)
+            )
+        else:
+            raise FileNotFoundError("Не удалось найти или сохранить обрезанное изображение")
+
         labels = prediction_dict['labels'].cpu().numpy()
         scores = prediction_dict['scores'].cpu().numpy()
         found_classes = {processor_mask_rcnn.class_names[label] for label in labels[scores >= 0.5]}
@@ -328,6 +336,24 @@ def process_tirads_composition_callback(call):
             bot.send_message(call.message.chat.id, "❌ Не найден скан для анализа.")
             return
 
+        required_files = ['cropped_filepath', 'mask_binary_filepath']
+        missing_files = [f for f in required_files if not scan.get(f)]
+
+        if missing_files:
+            bot.send_message(
+                call.message.chat.id,
+                f"❌ Отсутствуют необходимые файлы для анализа: {', '.join(missing_files)}"
+            )
+            return
+
+        if not os.path.exists(scan['cropped_filepath']):
+            bot.send_message(call.message.chat.id, "❌ Обрезанное изображение не найдено на сервере.")
+            return
+
+        if not os.path.exists(scan['mask_binary_filepath']):
+            bot.send_message(call.message.chat.id, "❌ Маска узла не найдена на сервере.")
+            return
+
         if not scan['mask_filepath']:
             bot.send_message(call.message.chat.id, "❌ Не найдена маска узла для анализа.")
             return
@@ -403,16 +429,19 @@ def delete_messages(chat_id, message_ids):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('rate_'))
 def handle_rating(call):
     try:
-        _, scan_id, rating = call.data.split('_')
+        _, scan_id, rating = call.data.split('_', 2)
         rating = int(rating)
-        if not 1 <= rating <= 5:
+
+        if rating < 1 or rating > 5:
             raise ValueError("Недопустимая оценка")
 
         scan = db.fetch_one("SELECT analysis_type FROM scans WHERE scan_id = %s", (scan_id,))
         if not scan:
             raise Exception("Scan not found")
+
         analysis_type = scan['analysis_type']
 
+        # Сохраняем оценку
         db.execute_query(
             "UPDATE scans SET user_rating=%s WHERE scan_id=%s",
             (rating, scan_id)
@@ -424,14 +453,24 @@ def handle_rating(call):
             call.message.message_id
         )
 
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        markup.add(types.KeyboardButton("Да"), types.KeyboardButton("Нет"))
-        msg = bot.send_message(
-            call.message.chat.id,
-            "🔁 Хотите проанализировать ещё один снимок?",
-            reply_markup=markup
-        )
-        bot.register_next_step_handler(msg, lambda m: ask_another_analysis(m))
+        # Если это AI-анализ и был найден узел — предложить ACR TI-RADS
+        if analysis_type == 'ai':
+            scan_data = db.fetch_one("SELECT mask_filepath FROM scans WHERE scan_id = %s", (scan_id,))
+            if scan_data and scan_data['mask_filepath']:
+                markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+                markup.add(types.KeyboardButton("Да"), types.KeyboardButton("Нет"))
+                msg = bot.send_message(
+                    call.message.chat.id,
+                    "🔁 Хотите также провести оценку этого узла по шкале ACR TI-RADS?",
+                    reply_markup=markup
+                )
+                bot.register_next_step_handler(msg, lambda m: handle_tirads_after_ai(m, scan_id))
+            else:
+                # Узел не найден — просто спросить, продолжать ли
+                ask_for_another_scan(call.message)
+        else:
+            # Для TI-RADS — сразу завершение или новый анализ
+            ask_for_another_scan(call.message)
 
     except ValueError as e:
         logging.error(f"Invalid rating value: {e}")
@@ -463,51 +502,90 @@ def ask_another_analysis(message):
 
 def handle_tirads_after_ai(message, scan_id):
     if message.text.lower() == 'да':
-        bot.send_message(message.chat.id, "🔄 Выполняется ACR TI-RADS анализ...")
-        scan = db.fetch_one("SELECT original_filepath, user_id FROM scans WHERE scan_id = %s", (scan_id,))
-        if not scan:
-            bot.send_message(message.chat.id, "❌ Не удалось найти исходный снимок.")
-            return
+        try:
+            # Получаем данные из БД о предыдущем анализе
+            scan = db.fetch_one("""
+                SELECT scan_id, user_id, original_filepath, processed_filepath, 
+                       cropped_filepath, mask_filepath, mask_binary_filepath 
+                FROM scans 
+                WHERE scan_id = %s
+            """, (scan_id,))
 
-        original_path = scan["original_filepath"]
-        user_id = scan["user_id"]
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        processed_filename = f"tirads_processed_{user_id}_{timestamp}.jpg"
-        processed_path = os.path.join('user_scans', 'processed', processed_filename)
+            if not scan:
+                bot.send_message(message.chat.id, "❌ Не удалось найти данные предыдущего анализа.")
+                return
 
-        with open(original_path, 'rb') as orig, open(processed_path, 'wb') as proc:
-            proc.write(orig.read())
+            # Создаем новую запись для TI-RADS анализа
+            new_scan_id = db.execute_query(
+                "INSERT INTO scans (user_id, analysis_type, original_filepath, "
+                "processed_filepath, cropped_filepath, mask_filepath, mask_binary_filepath) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (scan['user_id'], 'tirads', scan['original_filepath'],
+                 scan['processed_filepath'], scan['cropped_filepath'],
+                 scan['mask_filepath'], scan['mask_binary_filepath'])
+            )
 
-        new_scan_id = db.execute_query(
-            "INSERT INTO scans (user_id, original_filepath, processed_filepath, analysis_type, status) "
-            "VALUES (%s, %s, %s, %s, 'completed')",
-            (user_id, original_path, processed_path, 'tirads')
-        )
+            if scan['mask_filepath']:
+                with open(scan['mask_filepath'], 'rb') as mask_file:
+                    bot.send_photo(message.chat.id, mask_file, caption="🔴 Используем ранее найденный узел для анализа")
 
-        result_text = (
-            "✅ Анализ по шкале ACR TI-RADS:\n"
-            "Категория 4A\n"
-            "Риск злокачественности ~5-10%\n\n"
-            "Рекомендация: провести тонкоигольную аспирационную биопсию."
-        )
-        bot.send_message(message.chat.id, result_text)
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            options = [
+                ("Кистозный", "cystic"),
+                ("Почти полностью кистозный", "nearly_cystic"),
+                ("Микрокистозный", "microcystic"),
+                ("Смешанный - кистозный и тканевой", "mixed"),
+                ("Тканевой", "solid"),
+                ("Почти полностью тканевой", "nearly_solid")
+            ]
+            for text, key in options:
+                markup.add(types.InlineKeyboardButton(text, callback_data=f"tirads_composition_{key}_{new_scan_id}"))
 
-        markup_rate = types.InlineKeyboardMarkup(row_width=5)
-        markup_rate.add(
-            types.InlineKeyboardButton("1", callback_data=f"rate_{new_scan_id}_1"),
-            types.InlineKeyboardButton("2", callback_data=f"rate_{new_scan_id}_2"),
-            types.InlineKeyboardButton("3", callback_data=f"rate_{new_scan_id}_3"),
-            types.InlineKeyboardButton("4", callback_data=f"rate_{new_scan_id}_4"),
-            types.InlineKeyboardButton("5", callback_data=f"rate_{new_scan_id}_5")
+            bot.send_message(message.chat.id, "🧬 Оцените состав узла 🧬", reply_markup=markup)
+
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к TI-RADS: {e}")
+            bot.send_message(message.chat.id, "⚠ Произошла ошибка при переходе к анализу TI-RADS.")
+
+    elif message.text.lower() == 'нет':
+        ask_for_another_scan(message)
+    else:
+        bot.send_message(message.chat.id, "Пожалуйста, выберите 'Да' или 'Нет'.")
+        bot.register_next_step_handler(message, lambda m: handle_tirads_after_ai(m, scan_id))
+
+
+def ask_for_another_scan(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.add(types.KeyboardButton("Да"), types.KeyboardButton("Нет"))
+    msg = bot.send_message(
+        message.chat.id,
+        "🔁 Хотите проанализировать ещё один снимок?",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, lambda m: handle_restart_or_exit(m))
+
+
+def handle_restart_or_exit(message):
+    if message.text.lower() == 'да':
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(
+            types.KeyboardButton("Анализ снимка (AI) 🔍"),
+            types.KeyboardButton("Оценка по ACR TI-RADS📊")
         )
         bot.send_message(
             message.chat.id,
-            "⭐️ Оцените качество анализа ⭐️",
-            reply_markup=markup_rate
+            "📤 Выберите тип анализа:",
+            reply_markup=markup
         )
-
+    elif message.text.lower() == 'нет':
+        bot.send_message(
+            message.chat.id,
+            "👋 Благодарим за использование системы. До новых встреч!",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
     else:
-        bot.send_message(message.chat.id, "👌 Хорошо, пропускаем дополнительный анализ.")
+        bot.send_message(message.chat.id, "Пожалуйста, выберите 'Да' или 'Нет'.")
+        bot.register_next_step_handler(message, lambda m: handle_restart_or_exit(m))
 
 
 def create_collage(original_image_path, cropped_image_with_nodule_path):
