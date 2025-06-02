@@ -74,6 +74,140 @@ def request_tirads_scan(message):
                      "📤 Отправьте фото УЗИ щитовидной железы для анализа по шкале ACR TI-RADS. Убедитесь, что снимок четкий и захватывает всю область.")
 
 
+def process_and_save_image(original_path, scan_id):
+    result_buffer, prediction_dict, combined_cropped_path = processor_mask_rcnn.process_image(original_path)
+    if result_buffer is None or prediction_dict is None:
+        raise Exception("Не удалось обработать изображение")
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    original_filename = os.path.basename(original_path)
+    processed_filename = f"processed_{original_filename}"
+    processed_path = os.path.join('user_scans', 'processed', processed_filename)
+
+    with open(processed_path, 'wb') as f:
+        f.write(result_buffer.getvalue())
+
+    db.execute_query(
+        "UPDATE scans SET processed_filepath=%s, status='completed' WHERE scan_id=%s",
+        (processed_path, scan_id)
+    )
+
+    return prediction_dict, combined_cropped_path, processed_path, timestamp
+
+
+def generate_caption(found_classes):
+    caption = "Анализирую... 🧠\nНа изображении выделены:\n🟣 Щитовидная железа"
+    if 'Carotis' in found_classes:
+        caption += "\n🟢 Сонная артерия"
+    return caption.strip()
+
+
+def send_processed_image(bot, chat_id, processed_path, caption, messages_to_delete):
+    with open(processed_path, 'rb') as photo:
+        sent_msg = bot.send_photo(chat_id, photo, caption=caption)
+        messages_to_delete.append(sent_msg.message_id)
+
+
+def detect_nodule(combined_cropped_path, scan_id):
+    yolo_sam_processor = YOLOSAMNodeAnalyzer(
+        yolo_weights_path='neural_networks/train8_node_yolo12/weights/best.pt',
+        sam_checkpoint_path='neural_networks/sam_vit_h_4b8939.pth',
+        sam_finetuned_path='neural_networks/sam_best_node.pth'
+    )
+    masks, mask_vis_path, binary_mask_path = yolo_sam_processor.process(combined_cropped_path)
+
+    if masks and mask_vis_path:
+        db.execute_query(
+            "UPDATE scans SET mask_filepath=%s, mask_binary_filepath=%s WHERE scan_id=%s",
+            (mask_vis_path, binary_mask_path, scan_id)
+        )
+
+    return masks, mask_vis_path
+
+
+def handle_collage(bot, chat_id, processed_path, mask_vis_path, timestamp, messages_to_delete):
+    collage = create_collage(processed_path, mask_vis_path) if mask_vis_path else create_single_image_collage(processed_path)
+    caption = "✅ AI-анализ выполнен" if mask_vis_path else "🔴 Узлы не найдены"
+
+    if collage:
+        collage_path = os.path.join('user_scans', 'processed', f"collage_{timestamp}.png")
+        collage.save(collage_path)
+        with open(collage_path, 'rb') as collage_file:
+            sent_msg = bot.send_photo(chat_id, collage_file, caption=caption)
+        Timer(5.0, delete_messages, args=[chat_id, messages_to_delete]).start()
+
+
+def process_ai_analysis(message, scan_id, original_path, original_filename, timestamp):
+    try:
+        prediction_dict, combined_cropped_path, processed_path, timestamp_func = process_and_save_image(original_path, scan_id)
+
+        labels = prediction_dict['labels'].cpu().numpy()
+        scores = prediction_dict['scores'].cpu().numpy()
+        found_classes = {processor_mask_rcnn.class_names[label] for label in labels[scores >= 0.5]}
+        caption = generate_caption(found_classes)
+
+        messages_to_delete = []
+        send_processed_image(bot, message.chat.id, processed_path, caption, messages_to_delete)
+
+        if combined_cropped_path:
+            masks, mask_vis_path = detect_nodule(combined_cropped_path, scan_id)
+            db.execute_query(
+                "UPDATE scans SET mask_filepath=%s WHERE scan_id=%s",
+                (mask_vis_path, scan_id)
+            )
+            handle_collage(bot, message.chat.id, processed_path, mask_vis_path, timestamp, messages_to_delete)
+
+        markup_rate = types.InlineKeyboardMarkup(row_width=5)
+        markup_rate.add(*[types.InlineKeyboardButton(str(i), callback_data=f"rate_{scan_id}_{i}") for i in range(1, 6)])
+        bot.send_message(message.chat.id, "⭐️ Оцените качество анализа ⭐️", reply_markup=markup_rate)
+
+    except Exception as e:
+        logging.error(f"Ошибка в AI-анализе: {e}")
+        bot.reply_to(message, "⚠ Ошибка при выполнении анализа.")
+
+
+def process_tirads_analysis(message, scan_id, original_path, original_filename, timestamp):
+    try:
+        prediction_dict, combined_cropped_path, processed_path, _ = process_and_save_image(original_path, scan_id)
+
+        labels = prediction_dict['labels'].cpu().numpy()
+        scores = prediction_dict['scores'].cpu().numpy()
+        found_classes = {processor_mask_rcnn.class_names[label] for label in labels[scores >= 0.5]}
+        caption = generate_caption(found_classes)
+
+        messages_to_delete = []
+        send_processed_image(bot, message.chat.id, processed_path, caption, messages_to_delete)
+
+        img_pil = Image.open(original_path).convert("RGB")
+        combined_cropped_path = processor_mask_rcnn._crop_combined_thyroid_carotis(img_pil, prediction_dict, original_path)
+        db.execute_query(
+            "UPDATE scans SET cropped_filepath=%s WHERE scan_id=%s",
+            (combined_cropped_path, scan_id)
+        )
+
+        if combined_cropped_path:
+            masks, mask_vis_path = detect_nodule(combined_cropped_path, scan_id)
+            handle_collage(bot, message.chat.id, processed_path, mask_vis_path, timestamp, messages_to_delete)
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        options = [
+            ("Кистозный", "cystic"),
+            ("Почти полностью кистозный", "nearly_cystic"),
+            ("Микрокистозный", "microcystic"),
+            ("Смешанный - кистозный и тканевой", "mixed"),
+            ("Тканевой", "solid"),
+            ("Почти полностью тканевой", "nearly_solid")
+        ]
+        for text, key in options:
+            markup.add(types.InlineKeyboardButton(text, callback_data=f"tirads_composition_{key}_{scan_id}"))
+
+        bot.send_message(message.chat.id, "🧬 Теперь оцените состав узла 🧬", reply_markup=markup)
+
+    except Exception as e:
+        logging.error(f"Ошибка в TI-RADS анализе: {e}")
+        bot.reply_to(message, "⚠ Ошибка при выполнении анализа.")
+
+
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     try:
@@ -94,7 +228,7 @@ def handle_photo(message):
         target_size = (528, 528)
         if img.shape[0] != target_size[1] or img.shape[1] != target_size[0]:
             print(f"[INFO] Изменяем размер изображения с {img.shape[1]}x{img.shape[0]} до {target_size}")
-            padded_img, _, _, _, _ = resize_with_padding(img, target_size=target_size)
+            padded_img = resize_with_padding(img, target_size)[0]
         else:
             padded_img = img
 
@@ -104,9 +238,9 @@ def handle_photo(message):
         scan_id = None
 
         if message.from_user.id in user_context:
-            scan_id = user_context[message.from_user.id]['scan_id']
-            analysis_type = user_context[message.from_user.id]['analysis_type']
-            del user_context[message.from_user.id]
+            context = user_context.pop(message.from_user.id)
+            scan_id = context['scan_id']
+            analysis_type = context['analysis_type']
 
         if not scan_id:
             scan_id = db.execute_query(
@@ -119,208 +253,13 @@ def handle_photo(message):
                 (original_path, scan_id)
             )
 
-        # Обработка для ACR TI-RADS: выполняем нейросетевой анализ перед запросом состава узла
         if analysis_type == 'tirads':
-            result_buffer, prediction_dict, combined_cropped_path = processor_mask_rcnn.process_image(original_path)
-
-            if result_buffer is None or prediction_dict is None:
-                raise Exception("Не удалось обработать изображение")
-
-            img = Image.open(original_path).convert("RGB")
-
-            processed_filename = f"processed_{original_filename}"
-            processed_path = os.path.join('user_scans', 'processed', processed_filename)
-
-            with open(processed_path, 'wb') as f:
-                f.write(result_buffer.getvalue())
-
-            db.execute_query(
-                "UPDATE scans SET processed_filepath=%s, status='completed' WHERE scan_id=%s",
-                (processed_path, scan_id)
-            )
-
-            # Определяем, был ли найден Carotis
-            labels = prediction_dict['labels'].cpu().numpy()
-            scores = prediction_dict['scores'].cpu().numpy()
-            keep = scores >= 0.5
-            detected_labels = labels[keep]
-
-            found_classes = set()
-            for label in detected_labels:
-                class_name = processor_mask_rcnn.class_names[label]
-                found_classes.add(class_name)
-
-            # Обрезаем изображение по объединённой области Thyroid + Carotis
-            combined_cropped_path = processor_mask_rcnn._crop_combined_thyroid_carotis(img, prediction_dict, original_path)
-
-            caption = "Анализирую... 🧠\n\nНа изображении выделены:\n"
-            caption += "🟣 Щитовидная железа\n"
-            if 'Carotis' in found_classes:
-                caption += "🟢 Сонная артерия\n"
-
-            messages_to_delete = []
-            with open(processed_path, 'rb') as photo:
-                sent_msg = bot.send_photo(message.chat.id, photo, caption=caption.strip())
-                messages_to_delete.append(sent_msg.message_id)
-
-            # Детекция узла через YOLO + SAM
-            if combined_cropped_path:
-                print(f"[DEBUG] Обрезанное изображение сохранено: {combined_cropped_path}")
-
-                yolo_sam_processor = YOLOSAMNodeAnalyzer(
-                    yolo_weights_path='neural_networks/train8_node_yolo12/weights/best.pt',
-                    sam_checkpoint_path='neural_networks/sam_vit_h_4b8939.pth',
-                    sam_finetuned_path='neural_networks/sam_best_node.pth'
-                )
-                masks, mask_vis_path, binary_mask_path = yolo_sam_processor.process(combined_cropped_path)
-
-                db.execute_query(
-                    "UPDATE scans SET cropped_filepath=%s WHERE scan_id=%s",
-                    (combined_cropped_path, scan_id)
-                )
-
-                if masks and mask_vis_path:
-                    db.execute_query(
-                        "UPDATE scans SET mask_filepath=%s, mask_binary_filepath=%s WHERE scan_id=%s",
-                        (mask_vis_path, binary_mask_path, scan_id)
-                    )
-
-                    with open(mask_vis_path, 'rb') as mask_file:
-                        sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
-                        messages_to_delete.append(sent_msg.message_id)
-                    collage = create_collage(processed_path, mask_vis_path)
-                    caption = "Объекты найдены, перехожу к оценке по ACR TI-RADS 🩺"
-                else:
-                    collage = create_single_image_collage(processed_path)
-                    caption = "Узлы не найдены, попробуйте снова 🔁"
-
-                if collage:
-                    collage_path = os.path.join('user_scans', 'processed', f"collage_{timestamp}.png")
-                    try:
-                        collage.save(collage_path)
-                        with open(collage_path, 'rb') as collage_file:
-                            sent_msg = bot.send_photo(message.chat.id, collage_file, caption=caption)
-                        Timer(5.0, delete_messages, args=[message.chat.id, messages_to_delete]).start()
-                    except Exception as e:
-                        logging.error(f"Error saving/sending collage: {e}")
-                        bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
-                else:
-                    bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
-
-            # Отправляем кнопки для выбора состава узла
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            markup.add(
-                types.InlineKeyboardButton("Кистозный", callback_data=f"tirads_composition_cystic_{scan_id}"),
-                types.InlineKeyboardButton("Почти полностью кистозный", callback_data=f"tirads_composition_nearly_cystic_{scan_id}"),
-                types.InlineKeyboardButton("Микрокистозный", callback_data=f"tirads_composition_microcystic_{scan_id}"),
-                types.InlineKeyboardButton("Смешанный - кистозный и тканевой", callback_data=f"tirads_composition_mixed_{scan_id}"),
-                types.InlineKeyboardButton("Тканевой", callback_data=f"tirads_composition_solid_{scan_id}"),
-                types.InlineKeyboardButton("Почти полностью тканевой", callback_data=f"tirads_composition_nearly_solid_{scan_id}")
-            )
-            bot.send_message(
-                message.chat.id,
-                "🧬 Теперь оцените состав узла 🧬",
-                reply_markup=markup
-            )
-
+            process_tirads_analysis(message, scan_id, original_path, original_filename, timestamp)
         else:
-            # Логика для AI-анализа
-            result_buffer, prediction_dict, combined_cropped_path = processor_mask_rcnn.process_image(original_path)
-            if result_buffer is None or prediction_dict is None:
-                raise Exception("Не удалось обработать изображение")
-
-            img = Image.open(original_path).convert("RGB")
-            processed_filename = f"processed_{original_filename}"
-            processed_path = os.path.join('user_scans', 'processed', processed_filename)
-
-            with open(processed_path, 'wb') as f:
-                f.write(result_buffer.getvalue())
-
-            db.execute_query(
-                "UPDATE scans SET processed_filepath=%s, status='completed' WHERE scan_id=%s",
-                (processed_path, scan_id)
-            )
-
-            # Определяем, был ли найден Carotis
-            labels = prediction_dict['labels'].cpu().numpy()
-            scores = prediction_dict['scores'].cpu().numpy()
-            keep = scores >= 0.5
-            detected_labels = labels[keep]
-            found_classes = set()
-
-            for label in detected_labels:
-                class_name = processor_mask_rcnn.class_names[label]
-                found_classes.add(class_name)
-
-            # Обрезаем изображение по объединённой области Thyroid + Carotis
-            combined_cropped_path = processor_mask_rcnn._crop_combined_thyroid_carotis(img, prediction_dict, original_path)
-
-            caption = "Анализирую... 🧠\n\nНа изображении выделены:\n"
-            caption += "🟣 Щитовидная железа\n"
-            if 'Carotis' in found_classes:
-                caption += "🟢 Сонная артерия\n"
-
-            messages_to_delete = []
-
-            with open(processed_path, 'rb') as photo:
-                sent_msg = bot.send_photo(message.chat.id, photo, caption=caption.strip())
-                messages_to_delete.append(sent_msg.message_id)
-
-            # Детекция узла через YOLO + SAM
-            if combined_cropped_path:
-                print(f"[DEBUG] Обрезанное изображение сохранено: {combined_cropped_path}")
-
-                yolo_sam_processor = YOLOSAMNodeAnalyzer(
-                    yolo_weights_path='neural_networks/train8_node_yolo12/weights/best.pt',
-                    sam_checkpoint_path='neural_networks/sam_vit_h_4b8939.pth',
-                    sam_finetuned_path='neural_networks/sam_best_node.pth'
-                )
-                masks, mask_vis_path, binary_mask_path = yolo_sam_processor.process(combined_cropped_path)
-
-                if masks and mask_vis_path:
-                    db.execute_query(
-                        "UPDATE scans SET mask_filepath=%s WHERE scan_id=%s",
-                        (mask_vis_path, scan_id)
-                    )
-
-                    with open(mask_vis_path, 'rb') as mask_file:
-                        sent_msg = bot.send_photo(message.chat.id, mask_file, caption="🔴 Детекция узла завершена")
-                        messages_to_delete.append(sent_msg.message_id)
-                    collage = create_collage(processed_path, mask_vis_path)
-                    caption = "✅ AI-анализ выполнен"
-                else:
-                    collage = create_single_image_collage(processed_path)
-                    caption = "✅ AI-анализ выполнен"
-
-                if collage:
-                    collage_path = os.path.join('user_scans', 'processed', f"collage_{timestamp}.png")
-                    try:
-                        collage.save(collage_path)
-                        with open(collage_path, 'rb') as collage_file:
-                            sent_msg = bot.send_photo(message.chat.id, collage_file, caption=caption)
-                        Timer(5.0, delete_messages, args=[message.chat.id, messages_to_delete]).start()
-                    except Exception as e:
-                        logging.error(f"Error saving/sending collage: {e}")
-                        bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
-                else:
-                    bot.send_message(message.chat.id, "⚠ Не удалось создать коллаж")
-
-            markup_rate = types.InlineKeyboardMarkup(row_width=5)
-            markup_rate.add(
-                types.InlineKeyboardButton("1", callback_data=f"rate_{scan_id}_1"),
-                types.InlineKeyboardButton("2", callback_data=f"rate_{scan_id}_2"),
-                types.InlineKeyboardButton("3", callback_data=f"rate_{scan_id}_3"),
-                types.InlineKeyboardButton("4", callback_data=f"rate_{scan_id}_4"),
-                types.InlineKeyboardButton("5", callback_data=f"rate_{scan_id}_5")
-            )
-            bot.send_message(
-                message.chat.id,
-                "⭐️ Оцените качество анализа ⭐️",
-                reply_markup=markup_rate
-            )
+            process_ai_analysis(message, scan_id, original_path, original_filename, timestamp)
 
     except Exception as e:
-        logging.error(f"Ошибка при обработке фото: {e}")
+        logging.error(f"Ошибка при обработке фото: {e}", exc_info=True)
         bot.reply_to(message, "⚠ Произошла ошибка при обработке изображения. Попробуйте снова.")
 
 
